@@ -1,0 +1,48 @@
+\documentclass[12pt,a4paper]{ctexart}
+
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{setspace}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{amsmath,amssymb}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage[backend=biber,style=gb7714-2015]{biblatex}
+
+\addbibresource{references.bib}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=teal,
+    urlcolor=magenta,
+    pdftitle={WildDet3D 论文阅读笔记},
+    pdfauthor={}
+}
+
+\setstretch{1.2}
+\setlist[itemize]{leftmargin=2em}
+\setlist[enumerate]{leftmargin=2.2em}
+
+\title{WildDet3D 论文阅读笔记}
+\author{}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+\input{sections/01_overview}
+\input{sections/02_method}
+\input{sections/03_experiments}
+\input{sections/04_reflection}
+
+\printbibliography
+
+\end{document}
