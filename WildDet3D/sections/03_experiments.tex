@@ -1,34 +1,21 @@
 \section{实验与结果}
 
-\subsection{数据集与评价指标}
+\subsection{评价重点}
 
-请记录本文使用的数据集、划分方式和评价指标。
+从现有笔记信息看，实验部分需要关注三类问题。第一，WildDet3D 是否在开放世界类别上优于传统受控场景 3D 检测方法；第二，多提示输入是否真的带来更强的交互灵活性；第三，optional depth、O2M matching、3D confidence 和辅助 2D/geometry losses 是否分别对性能有贡献。
 
-\subsection{主要实验结果}
+\subsection{主要结论}
 
-\begin{table}[H]
-    \centering
-    \begin{tabular}{lcc}
-        \toprule
-        方法 & 指标 1 & 指标 2 \\
-        \midrule
-        Baseline & -- & -- \\
-        WildDet3D & -- & -- \\
-        \bottomrule
-    \end{tabular}
-    \caption{主要实验结果整理}
-\end{table}
+\begin{itemize}
+    \item 联合 2D 与 3D 预测非常关键。原始笔记中记录的消融结论显示，去掉 2D head 后 AP 从 30.2 大幅下降到 11.1，说明 3D Head 高度依赖稳定的 2D query 表示。
+    \item O2M matching 是训练目标中影响较大的设计之一。去掉 O2M 后 AP3D 下降约 2.5，说明一对多匹配确实能让更多 query 获得正样本监督。
+    \item 几何损失对性能有稳定增益。去掉 geometry loss 后 AP 下降约 1.7，说明深度、相机和点图监督不是附属装饰，而是提升 3D 几何质量的重要训练信号。
+    \item 3D confidence head 对排序有帮助。去掉该分支后 AP 下降约 0.8，说明显式学习 3D 质量分数能够改善最终候选框排序。
+    \item ignore-aware suppression 的收益较小但方向正确。原始笔记记录其在 Omni3D 上带来约 0.2 AP 影响，在部分 3D 标注更常见的数据中可能更重要。
+\end{itemize}
 
-\subsection{消融实验}
+\subsection{实验理解}
 
-请总结每个模块带来的性能变化。
+这些消融结果的主线比较清晰：WildDet3D 的性能不是由单个模块孤立贡献，而是由“高质量 2D queries + 几何后端 + 3D 提升头 + 稳定匹配策略”共同支撑。尤其是 2D Head 和 O2M matching，它们直接决定有多少 query 能学到有效目标表示，也决定后续 3D Head 是否有可靠输入。
 
-\subsection{可视化与案例分析}
-
-如果你后续导出图片，可以放在 `figures/` 目录，并用如下方式插入：
-
-\begin{figure}[H]
-    \centering
-    % \includegraphics[width=0.8\textwidth]{figures/example.png}
-    \caption{结果可视化示意}
-\end{figure}
+因此，复现实验时不应只关注最终 3D 框回归公式，还需要检查 2D 查询生成、正负样本分配、ignore region 处理、深度可用性设置和 final score 融合方式。任何一个环节实现偏差，都可能导致 3D AP 明显波动。

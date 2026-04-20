@@ -1,0 +1,117 @@
+\section{训练策略与后训练}
+
+\subsection{预训练阶段的三类损失}
+
+HY-Embodied-0.5 的预训练目标不是单一语言损失，而是联合优化三类损失：
+
+\begin{equation}
+    L_{\text{total}}
+    = L_{\text{llm}} + L_{\text{vision}} + L_{\text{global}}.
+\end{equation}
+
+三者分别监督不同对象：
+
+\begin{itemize}
+    \item $L_{\text{vision}}$ 监督普通视觉 token，使其预测 teacher ViT 生成的离散 patch code，负责局部细节和 patch-level 视觉结构。
+    \item $L_{\text{global}}$ 监督 visual latent token，使其对齐 teacher ViT 的全局 CLS 特征，负责整图摘要和视觉到语言的桥接。
+    \item $L_{\text{llm}}$ 监督 language tokens，负责自回归文本生成、推理链和最终答案。
+\end{itemize}
+
+这种设计可以理解成把“看细节”“抓全局”“说出来”拆开监督。若只用 $L_{\text{llm}}$，视觉分支只能通过最终答案误差获得间接梯度，难以稳定学习 patch-level 表征；若没有 $L_{\text{global}}$，visual latent token 也未必自然成长为可靠的全局语义接口。
+
+\subsection{为什么后续阶段只保留语言损失}
+
+论文在 mid-training 和 fine-tuning 阶段去掉 vision/global supervision，只保留标准自回归语言损失。这背后的逻辑是训练阶段目标发生变化：预训练阶段主要负责把视觉底座、跨模态接口和语言生成能力打稳；后续阶段则更关注具身任务中的指令跟随、空间推理、长链推理和回答格式对齐。
+
+如果后期继续强推视觉 token 预测离散 code，或强推 latent token 对齐 teacher CLS，优化重心会持续停留在视觉表征拟合上，可能干扰任务级推理和输出对齐。因此后续阶段相当于固定或弱化底层视觉塑形目标，把优化重点转向“如何使用已有视觉能力完成任务”。
+
+\subsection{监督微调 SFT}
+
+后训练的第一步是监督微调。SFT 阶段重点强化长链推理能力。作者从空间、具身和通用数据源中筛选高复杂度、多步骤问题，并结合内部推理数据，构造 Chain-of-Thought (CoT) 推理轨迹。
+
+这些 CoT 由人类与模型协作生成，再由 LLM 从推理质量、逻辑正确性、序列重复等维度进行评估，同时对最终答案做精确匹配验证。最终构建约 100k 条冷启动 CoT 数据，用于训练 MoT-2B 和 MoE-A32B 模型。
+
+训练上仍使用标准交叉熵损失，但关闭 sequence packing，让每个样本独立处理，以减少不同推理链之间的干扰。原始笔记中记录学习率为 $5\times10^{-5}$。
+
+\subsection{强化学习 RL}
+
+强化学习阶段不再使用固定数据集，而是动态构建训练数据。模型维护一个覆盖不同具身能力的大规模候选样本池，每轮 RL 用当前模型多次采样评估这些样本，再根据成功率筛选：
+
+\begin{itemize}
+    \item 全部成功的样本太简单，丢弃。
+    \item 全部失败的样本太难，丢弃。
+    \item 部分成功的样本位于当前能力边界附近，保留。
+\end{itemize}
+
+这相当于一种能力自适应课程学习。为了避免过拟合某类能力，数据还会在感知、预测、交互和规划等维度上做平衡。原始笔记中记录每轮 RL 使用约 50K 样本。
+
+\subsection{任务感知奖励设计}
+
+具身任务输出形式多样，无法用一个统一 reward 覆盖所有情况。论文采用 task-aware reward：
+
+\begin{equation}
+    r = R_t(y, y^\star) \in [0,1].
+\end{equation}
+
+主要奖励类型包括：
+
+\begin{itemize}
+    \item Grounding-based：用于空间定位，包含 IoU、Hungarian IoU、点距离和 Chamfer 距离等。
+    \item Regression-based：用于计数、距离估计等数值任务，通常使用相对误差衰减函数。
+    \item Trajectory-based：用于路径规划和动作序列，使用 DTW、Frechet 距离和终点一致性等指标。
+    \item Textual-based：固定答案可用精确匹配，开放回答可用 LLM judge。
+\end{itemize}
+
+核心原则是奖励结构必须匹配输出结构：连续输出用连续 reward，离散封闭问题用 exact match，开放文本问题用 LLM judge。
+
+\subsection{GRPO 训练}
+
+论文使用 GRPO (Group Relative Policy Optimization)。对同一输入 $x$ 采样 $G=16$ 个回答，计算组内归一化 advantage：
+
+\begin{equation}
+    A_i = \frac{r_i-\mu(r)}{\sigma(r)}.
+\end{equation}
+
+这种组内归一化可以缓解不同任务 reward 尺度不一致的问题。优化目标可概括为 clipped policy objective：
+
+\begin{equation}
+    \mathcal{L}_{RL}
+    = -\sum \min(\rho A, \mathrm{clip}(\rho)A),
+\end{equation}
+
+其中
+
+\begin{equation}
+    \rho = \frac{\pi_\theta}{\pi_{\theta_{\mathrm{old}}}}.
+\end{equation}
+
+原始笔记中记录的训练细节包括：group size 为 16，batch size 为 128，学习率为 $8\times10^{-7}$，训练 5 epoch，最大上下文和最大输出均为 16k。额外稳定措施包括去掉 reward variance 为 0 的样本、限制过长输出，以及使用非对称 clipping $[0.8,1.35]$。
+
+\subsection{RFT：迭代式深度推理训练}
+
+RL 能提高 reward，但不一定保证推理过程质量。因此论文引入 RFT (Rejection Sampling Fine-Tuning)。其流程是：用当前模型生成多个答案，丢弃全对和全错样本，保留部分正确样本，再由强 teacher 评估推理轨迹质量，只保留高质量推理路径。
+
+原始笔记中记录的规模是从约 100 万候选中筛出约 30 万高质量数据。RFT 与 RL 的关系可以概括为：RL 负责探索能力边界，RFT 负责固化优质推理路径。二者交替进行：
+
+\begin{equation}
+    \mathrm{RL} \rightarrow \mathrm{RFT} \rightarrow \mathrm{RL} \rightarrow \cdots
+\end{equation}
+
+这样可以把偶然成功逐步转化为稳定能力。
+
+\subsection{OPD：大到小的 On-Policy 蒸馏}
+
+OPD 的目标是把大模型能力迁移到小模型。与传统只学习 teacher 输出的蒸馏不同，on-policy distillation 让 student 先按自己的策略生成轨迹：
+
+\begin{equation}
+    y \sim \pi_s,
+\end{equation}
+
+然后 teacher 在 student 的轨迹上做 teacher forcing，并对齐 teacher 与 student 的分布：
+
+\begin{equation}
+    \mathcal{L}_{OPD}
+    = \sum KL(\pi_t \| \pi_s).
+\end{equation}
+
+这种方式的优势是 student 会在“自己真实会犯错的地方”获得监督，从而减少 train-test mismatch。整个后训练 pipeline 可以理解为：SFT 提供冷启动推理能力，RL 扩展能力边界，RFT 提炼高质量推理路径，OPD 将大模型发现的能力迁移给小模型。

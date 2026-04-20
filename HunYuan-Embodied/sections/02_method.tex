@@ -1,0 +1,133 @@
+\section{方法细节}
+
+\subsection{HY-ViT 2.0：视觉前端}
+
+论文中“HY-Embodied-0.5 使用的 ViT 是 HY-ViT 的升级版本”可以理解为：作者没有从零发明全新的视觉编码器，而是在腾讯混元已有的 HY-ViT 系列上继续迭代，形成 HY-ViT 2.0，并把它作为具身模型的视觉前端。HY-ViT 不是 ViT、CLIP、SAM 那类通用公共架构名，更像是作者团队自己的视觉模型系列。
+
+HY-ViT 2.0 保留了原生支持任意分辨率输入的能力，并在数据规模、监督方式和部署效率上做了增强。论文选择 400M 参数规模的 ViT，是因为真实世界智能体常需要在边缘设备或实时系统中运行，视觉骨干不能无限增大。400M 模型本身提供较低延迟和较低内存压力，而从更强内部 ViT 蒸馏则用于尽量把大模型的表征能力迁移给小模型。
+
+这一设计的本质是“先选一个能部署的学生模型，再用老师模型提高它的表示上限”。蒸馏不能凭空保证实时性，实时性主要来自学生模型规模和工程实现；蒸馏的作用是让这个较小模型不要因为容量较低而显著损失视觉准确性。
+
+\subsection{Tiny LLM 语言监督}
+
+论文提到 HY-ViT 2.0 引入 tiny LLM 来提供 language supervision signals。其核心含义不是在推理时额外部署一个小语言模型，而是在训练视觉编码器时引入语言侧约束，让视觉 token 更适合被语言模型读取。
+
+一种合理的实现方式是：图像先进入 ViT 得到视觉 token，再经过 projector 映射到语言模型 hidden size，然后由 tiny LLM 根据这些视觉 token 预测 caption、object tags、区域描述或问答答案。对应损失可写成标准文本交叉熵：
+
+\begin{equation}
+    \mathcal{L}_{lang\_sup}
+    = - \sum_t \log p(y_t \mid y_{<t}, v_1,\dots,v_N).
+\end{equation}
+
+这条梯度会从 tiny LLM 的文本预测任务反传到视觉编码器，迫使 ViT 输出一种“语言可读”的视觉表示。它与只做分类或像素重建不同：语言监督要求视觉特征不仅包含颜色、边缘和局部形状，还要更容易组织成对象、关系和动作等语言概念。
+
+\subsection{视觉重建监督与离散视觉表示}
+
+视觉重建监督的目标是防止视觉特征只保留高层语义而丢掉细节。对于具身任务来说，仅知道“这里有杯子”不够，还需要杯子位置、朝向、可抓取区域、相对关系和局部边界等信息。因此论文希望视觉表示既支持理解，也支持重建或预测。
+
+为此，作者训练了一个更大规模的 ViT 来生成 discrete visual representation。可以把它理解成一个视觉 tokenizer：先把图像切成 $8\times8$ patch，再把每个 patch 映射到 codebook 中的一个离散编号。若 codebook size 为 2k，则可写作
+
+\begin{equation}
+    z_i \in \{1,\dots,2048\}.
+\end{equation}
+
+原本一个 RGB 的 $8\times8$ patch 有
+
+\begin{equation}
+    8 \times 8 \times 3 = 192
+\end{equation}
+
+个像素值；经过视觉 tokenizer 后，它被压缩成一个离散 code，例如 code 842。整张图于是变成一串离散视觉 token：
+
+\begin{equation}
+    [z_1,z_2,\dots,z_N], \qquad z_i \in \{1,\dots,2048\}.
+\end{equation}
+
+codebook 可以理解为有限大小的视觉词典，每个 entry 是一个局部视觉原型。某个 patch 最像哪个原型，就被量化成哪个编号。这一思想与 VQ-VAE、视觉 tokenizer 和离散视觉 token 属于同一类技术路线：把连续图像转成可建模的离散 token 序列。
+
+\subsection{用离散视觉表示监督 Visual Tokens}
+
+论文中“把这种表示拿来监督模型的视觉 token”指的是：由大 ViT 生成离散 code 作为老师答案，学生模型的视觉分支产生连续 hidden states，然后通过 MLP 分类头预测对应 code。若学生视觉 token 为 $h_i$，则
+
+\begin{equation}
+    p_i = \mathrm{Softmax}(\mathrm{MLP}(h_i)),
+\end{equation}
+
+其中 $p_i \in \mathbb{R}^{2048}$ 表示第 $i$ 个位置预测各 code 的概率。vision loss 可写为
+
+\begin{equation}
+    L_{\text{vision}}
+    = -\frac{1}{N_v}\sum_{i=1}^{N_v}\log p_i(z_i).
+\end{equation}
+
+这相当于让视觉分支做一种 visual next-code prediction。它不只依赖最终文本答案对错，而是给每个视觉 token 一个 patch-level 学习目标，从而强化局部纹理、边缘、形状和空间邻接关系建模。
+
+\subsection{MoT：视觉与语言的非共享参数}
+
+普通多模态 LLM 往往把视觉 token 和文本 token 拼接后送入同一套 Transformer 参数。HY-Embodied-0.5 采用 Mixture-of-Transformers (MoT)，让视觉 token 与文本 token 在每层中使用不同的 QKV 和 FFN 参数。
+
+可以把每层参数抽象为两套：
+
+\begin{equation}
+    W_Q^{txt}, W_K^{txt}, W_V^{txt}, W_{FFN}^{txt},
+\end{equation}
+
+\begin{equation}
+    W_Q^{vis}, W_K^{vis}, W_V^{vis}, W_{FFN}^{vis}.
+\end{equation}
+
+在多模态训练开始前，作者从预训练 LLM 中复制 QKV 和 FFN 参数，作为视觉分支的初始化：
+
+\begin{equation}
+    W_Q^{vis} \leftarrow W_Q^{txt}, \quad
+    W_K^{vis} \leftarrow W_K^{txt}, \quad
+    W_V^{vis} \leftarrow W_V^{txt}, \quad
+    W_{FFN}^{vis} \leftarrow W_{FFN}^{txt}.
+\end{equation}
+
+复制后的参数之所以能直接用于视觉 token，是因为视觉 token 已经通过 ViT/projector 映射到语言 embedding space，张量维度与 LLM hidden size 对齐。之后，视觉 token 使用复制出来的视觉专用参数计算，文本 token 继续使用原始文本参数计算。
+
+这样设计的原因是减少模态间梯度冲突。文本 token 需要保留语法、世界知识和推理生成能力；视觉 token 更关注局部纹理、空间结构和视觉模式。如果所有 token 共用一套参数，大量视觉训练可能会破坏原有语言能力。非共享参数允许视觉分支向视觉最优方向适配，同时文本分支尽量保住预训练 LLM 的语言能力。
+
+\subsection{Figure 2：整体结构}
+
+Figure~\ref{fig:hy-figure2} 展示了 HY-Embodied-0.5 的核心训练结构。底部是输入层：图像经过 HY-ViT 2.0-400M 得到视觉 token，每个视觉元素后追加一个 visual latent token，文本输入则作为 language tokens 进入模型。
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.96\textwidth]{figures/figure2.png}
+    \caption{HY-Embodied-0.5 的 MoT 结构、visual latent token 与三类训练目标。}
+    \label{fig:hy-figure2}
+\end{figure}
+
+中间是 HY-Embodied-0.5 MoT-2B 主干，视觉侧和语言侧分别拥有 QKV 与 FFN。注意力机制也根据模态有所区分：视觉侧更适合 local full attention，文本侧保持 global causal attention，以维持自回归语言建模。
+
+顶部是三个训练目标：Vision Loss 监督普通视觉 token，Global Loss 监督 visual latent token，LLM Loss 监督文本输出。这三个目标对应“看清局部”“抓住全局”“生成推理与答案”。
+
+\subsection{Visual Latent Token}
+
+visual latent token 不是每个 patch 后面加一个，而是每个视觉元素后面加一个。若单张图像经过 ViT 得到
+
+\begin{equation}
+    [v_1,v_2,\dots,v_N],
+\end{equation}
+
+则追加后变为
+
+\begin{equation}
+    [v_1,v_2,\dots,v_N,\ell],
+\end{equation}
+
+其中 $\ell$ 是可学习的 visual latent token。视频或多图输入时，每一帧或每张图后各有一个 latent token。
+
+它的作用类似一个全局摘要槽位。普通 patch token 偏局部，latent token 通过多层 attention 吸收整张图或整帧的全局信息，并位于视觉序列与文本序列之间，更适合作为视觉到语言的接口。训练时，论文使用 teacher ViT 的 global CLS feature 监督它，使其稳定承载整图语义。
+
+Global Loss 可写为负余弦相似度：
+
+\begin{equation}
+    L_{\text{global}}
+    = -\frac{f_{\text{latent}}^\top f_{\text{teacher}}}
+    {\|f_{\text{latent}}\|\|f_{\text{teacher}}\|}.
+\end{equation}
+
+这意味着模型被迫让 latent token 的输出特征接近强 teacher 的全局图像表示。它不是直接输出答案，而是在推理中作为中间状态参与后续 Transformer 计算，帮助语言 token 更容易读取高层视觉语义。

@@ -2,31 +2,184 @@
 
 \subsection{整体框架}
 
-请概述模型的输入、输出与整体流程。
-
-\subsection{核心模块拆解}
-
-\subsubsection{模块 1}
-
-记录该模块的作用、输入输出及设计动机。
-
-\subsubsection{模块 2}
-
-记录该模块与已有方法相比的不同点。
-
-\subsection{关键公式与损失函数}
-
-如果论文中有关键公式，可以在此整理：
+给定 RGB 图像 $I \in \mathbb{R}^{3\times H\times W}$、可选相机内参 $K$、可选深度图 $D \in \mathbb{R}^{H\times W}$ 以及用户提示 $P$，WildDet3D 输出一组 3D 边界框：
 
 \begin{equation}
-L = L_{det} + \lambda L_{aux}
+    B_i = (c_i, d_i, R_i, s_i),
 \end{equation}
 
-并说明各项的物理含义或优化目的。
+其中 $c_i \in \mathbb{R}^3$ 是 3D 中心位置，$d_i=(w,h,l)$ 是物理尺寸，$R_i \in SO(3)$ 是三维旋转，$s_i \in [0,1]$ 是预测置信度。系统主路径由四部分组成：Image Encoder 提取语义特征，RGBD Encoder 生成深度/几何潜变量，Depth Fusion Module 将几何信息注入视觉特征，Promptable Detector 与 3D Head 负责根据提示生成 2D 查询并提升为 3D 框。
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{figures/figure1.png}
+    \caption{WildDet3D 系统概览：输入来自不同设备，提示形式包括文本、点、框和示例，输出为开放世界目标的 3D 检测结果。}
+    \label{fig:wilddet3d-overview}
+\end{figure}
+
+这篇论文的关键不是只在某个封闭 benchmark 上做 3D 检测，而是把 3D 目标理解设计成一个更通用的接口：输入设备可以变化，提示方式可以变化，深度信息可以有也可以没有，目标类别也不局限于自动驾驶或室内数据集中的少数类别。
+
+\subsection{输入模态：RGB with Optional Depth}
+
+论文没有把 LiDAR 或深度传感器设为强依赖，而是采用 ``RGB with optional depth''。RGB 图像提供密集外观、纹理和语义信息，适合开放词汇识别；深度图提供度量尺度和前后关系，有助于解决单目视觉的尺度歧义。二者的关系可以理解为：RGB 负责“认得是什么”，深度负责“知道离多远、占多大空间”。
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{figures/figure2.png}
+    \caption{输入模态对比：LiDAR 几何准确但稀疏，RGB 语义丰富但尺度模糊，RGB + optional depth 在开放世界语义与几何尺度之间取得折中。}
+    \label{fig:wilddet3d-modalities}
+\end{figure}
+
+深度图本身仍是图像平面上的单通道标量图，它记录的是像素 $(u,v)$ 对应的深度 $Z=D(u,v)$，不是完整 3D 坐标。要得到相机坐标系下的三维点，需要结合内参反投影：
+
+\begin{equation}
+    X = \frac{(u - c_x)Z}{f_x}, \qquad
+    Y = \frac{(v - c_y)Z}{f_y}, \qquad
+    Z = D(u,v).
+\end{equation}
+
+因此，RGB 像素位置、深度值和相机内参共同决定真实三维点。WildDet3D 的几何后端正是围绕这个关系建模：没有外部深度时，模型利用 RGB 估计几何先验；有外部深度时，模型把真实几何测量作为增强项注入检测特征。
+
+\subsection{网络结构}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.98\textwidth]{figures/figure3.png}
+    \caption{WildDet3D 核心结构：双编码器、深度融合模块、Promptable Detector、2D Head、Depth Head 与 3D Head。}
+    \label{fig:wilddet3d-architecture}
+\end{figure}
+
+Image Encoder 采用来自 SAM 系列的强视觉骨干，利用分割预训练带来的密集边界、轮廓和局部结构表征。虽然最终任务是检测框回归，但 3D 框估计同样依赖目标轮廓、遮挡边界和空间占据范围，所以分割预训练对 3D 检测是有价值的。
+
+RGBD Encoder 则承担几何建模。论文使用 DINOv2 ViT-L/14 风格的几何分支处理 RGBD 输入。若输入分辨率为 $686\times686$，patch size 为 14，则 token 网格自然是 $49\times49$。这个 $49\times49$ 不是理论上唯一可行的形状，而是当前预训练几何后端和位置编码设定下的实现选择。
+
+双编码器设计的动机是减少语义与几何任务的冲突。检测希望特征对类别、纹理、语义模式敏感，并对尺度变化保持鲁棒；深度估计则希望特征对透视、距离、投影大小和几何细节敏感。若强行共用同一编码器，两类目标的梯度方向可能互相拉扯。WildDet3D 让语义和几何分别由不同专家处理，再在后端做有控制的融合。
+
+\subsection{深度融合：残差式几何注入}
+
+设视觉特征为 $V \in \mathbb{R}^{C \times H_v \times W_v}$，深度潜变量为 $Z_d \in \mathbb{R}^{C_d \times 49 \times 49}$。融合时先将 $Z_d$ 插值到 $H_v \times W_v$，再做归一化和 $1\times1$ 卷积投影，最后以残差形式加到视觉特征上：
+
+\begin{equation}
+    V' = V + \mathrm{Conv}_{1\times1}(\mathrm{LN}(Z_d^{\dagger})).
+\end{equation}
+
+这一步同时完成三类对齐：插值解决空间分辨率对齐，LayerNorm 解决数值尺度对齐，$1\times1$ 卷积解决通道语义对齐。即使论文实现中 $C_d$ 与 $C$ 都可能取 256，保留 $1\times1$ 卷积仍然有意义，因为它提供了几何特征到视觉工作空间的可学习重参数化接口。
+
+残差式注入的工程意义是让 RGB 视觉主干保持为稳定主路径，深度只作为增强项。训练初期若融合层接近零初始化，则 $V' \approx V$，几何分支不会立刻破坏已有视觉特征；随着训练进行，模型再学习何时相信深度、何时弱化深度。这也是“可插拔”和 fall back 的核心：没有真实深度时，系统仍能依赖 RGB 估计几何；有真实深度时，系统可以更积极地利用外部测量。
+
+\subsection{提示编码与 Promptable Detector}
+
+WildDet3D 支持文本、点、框和示例框。提示编码的本质是把这些异构输入统一成 prompt tokens，供后续模块在 cross-attention 中读取。
+
+\begin{itemize}
+    \item 文本提示经过 tokenizer 和文本 Transformer 编码，再投影到统一维度 $d=256$。这里编码的是开放文本短语，而不是固定类别 ID。
+    \item 点提示和框提示由坐标投影、局部图像特征和正弦位置编码相加得到。坐标提供精确位置，局部特征提供外观，位置编码便于 Transformer 建模空间关系。
+    \item 点提示还带有 positive/negative 标签嵌入，用于区分“支持目标的点”和“排除背景的点”。
+    \item 示例框提示复用 box encoding pipeline，但语义是“按这个样例寻找同类目标”，因此会额外引入类似 ``visual'' 的模式标记。
+\end{itemize}
+
+Promptable Detector 的输出不是最终框，而是一组统一查询表示，可记为
+
+\begin{equation}
+    Q^{(0)} = \mathcal{F}_{\text{prompt-det}}(V', P)
+    \in \mathbb{R}^{B \times S \times 256},
+\end{equation}
+
+其中 $S$ 是固定 query 槽位数。它通常不等于真实目标数，而是模型预留的一组候选席位。后续 2D Head 和 3D Head 会基于这些 query 进行预测，最后再通过分数筛选与去重保留高质量结果。
+
+\subsection{3D Head：把 2D Queries 提升为 3D 框}
+
+3D Head 的输入是 Promptable Detector 生成的 2D queries。它不是从零开始寻找目标，而是把已经被提示条件化、并大致锚定在图像目标上的查询进一步提升为 3D 框。每一层 decoder 都会读取两类几何信息：相机射线嵌入和深度潜变量。
+
+若第 $l$ 层的 query 状态为 $H^l \in \mathbb{R}^{S \times d}$，其更新过程可以概括为：先通过 self-attention 整合 query 之间的关系，再与 camera ray embeddings 做 cross-attention 获取视线方向信息，随后与 $Z_d$ 做 cross-attention 获取距离和局部几何信息，最后由 MLP 输出 3D box 参数和 3D confidence。论文对多层 decoder 的中间预测也施加损失，相当于深监督，有助于训练收敛。
+
+\subsection{训练目标与两类 Query 分支}
+
+训练时，论文为每个类别构造两类 query 分支：
+
+\begin{itemize}
+    \item multi-target query：由 text-only 或 exemplar box 触发，监督目标是该类别的所有实例。例如图中有 4 辆车，文本 ``car'' 的目标集合就是全部 4 辆车。
+    \item single-target geometric query：由 point 或 box 触发，监督目标是某个被选中的具体实例。例如点在第 2 辆车上，则目标集合只包含这一个实例。
+\end{itemize}
+
+这不是两套独立网络，而是在同一模型中训练两种 prompt 语义：文本/示例天然对应“找所有同类实例”，点/框天然对应“定位这个具体实例”。若只训练其中一种，另一种交互方式在推理时就缺少匹配的监督语义。
+
+\subsection{O2M 匹配}
+
+WildDet3D 使用 one-to-many (O2M) matching。设真实目标集合为 $G=\{g_1,\dots,g_N\}$，模型预测集合为 $Y=\{y_1,\dots,y_S\}$。对每个 GT $g_n$，选择匹配分数最高的 top-$k$ 个预测，论文中 $k=4$：
+
+\begin{equation}
+    \mathcal{T}(g_n)=\operatorname{TopK}_{s\in\{1,\dots,S\}}
+    \mathrm{score}(y_s,g_n), \qquad k=4.
+\end{equation}
+
+匹配索引集合为
+
+\begin{equation}
+    M=\{(s,n)\mid s\in\mathcal{T}(g_n)\}.
+\end{equation}
+
+这意味着一个 GT 不再只监督一个 query，而是监督多个 query。若一张图中有 $N$ 个目标，one-to-one 匹配大致产生 $N$ 个正匹配，而 top-4 O2M 会产生约 $4N$ 个正匹配。更多 query 收到正样本梯度，训练信号更密集，早期训练也更稳定。
+
+对应伪代码为：
+
+\begin{verbatim}
+M = []
+for each gt g_n:
+    scores = [(s, match_score(y_s, g_n)) for s in predictions]
+    topk = select_top_k(scores, k=4)
+    for s in topk:
+        M.append((s, n))
+\end{verbatim}
+
+\subsection{损失函数}
+
+论文总损失为
+
+\begin{equation}
+    L = L_{3D} + L_{conf} + L_{geom} + L_{2D}.
+\end{equation}
+
+$L_{3D}$ 和 $L_{conf}$ 是主任务损失，分别监督 3D 框参数和 3D 预测质量；$L_{geom}$ 与 $L_{2D}$ 是辅助损失，分别约束几何后端和 2D 检测分支。它们不是不重要，而是通过改善深度、相机和 2D 查询质量来间接服务最终 3D 检测。
+
+设 $N_{pos}=|M|$ 为正匹配数量。损失除以 $N_{pos}$ 的作用是把总误差变成“每个正匹配的平均误差”，避免 batch 中目标数量变化导致 loss 尺度线性波动。若 3D box 的某些维度缺少有效标注，则用逐维有效性权重 $w_k$ 屏蔽：
+
+\begin{equation}
+    w_k =
+    \begin{cases}
+        1, & \text{第 } k \text{ 个分量有有效标注},\\
+        0, & \text{第 } k \text{ 个分量无有效标注}.
+    \end{cases}
+\end{equation}
+
+3D confidence 分支用于预测“这个 3D 框有多可靠”。推理时最终得分可写作
+
+\begin{equation}
+    s = s_{2D} + \alpha s_{3D},
+\end{equation}
+
+因此仅有 2D 分类分数不够，还需要显式学习 3D 几何质量。该分支使用 BCE / focal BCE 是因为输出是 $[0,1]$ 区间内的质量分数。正样本目标不是硬标签 1，而是连续软标签，用来区分“匹配上但质量一般”和“匹配上且几何很准”的预测。
+
+回归质量可概括为深度质量与 3D IoU 的组合：
+
+\begin{equation}
+    q^* = \beta q_{depth} + (1-\beta) IoU_{3D}, \qquad
+    q_{depth}=\exp(-|\log \hat d-\log d^*|).
+\end{equation}
+
+正负例损失分开写，是因为负样本数量远多于正样本。若直接混合平均，负样本会淹没正样本。正例使用软标签 BCE 并提高权重，负例使用 focal 因子重点惩罚高分错误负样本。
+
+\subsection{几何损失、2D 辅助损失与 Ignore Region}
+
+$L_{geom}$ 由深度和几何估计中常见的部件组合而成，包括有效像素 L1 深度损失、尺度不变对数深度损失、深度有效性掩码 BCE、反投影点图损失和相机光线方向 L2 损失。这不是固定的社区模板，也不是完全凭空设计，而是“已有几何估计损失 + 本文可插拔几何后端需求”的组合。
+
+$L_{2D}$ 包括 IoU-aware BCE 分类损失、L1/GIoU 框回归、类别存在性损失和 O2M 匹配相关损失。2D 分支之所以重要，是因为 3D Head 依赖前级 2D queries；如果 2D 查询质量差，后续 3D 提升也会不稳定。
+
+论文单独处理 ignore region，是因为开放世界数据常有非穷尽标注：某些可见物体可能只有 2D 框，没有有效 3D GT。若模型预测到这些区域，却因为缺少 3D 标注而被当作负例惩罚，就会产生错误训练信号。因此，当预测与 ignore box 的 2D IoU 超过阈值时，论文抑制其负分类损失。该操作不会把 ignore 区域变成正例，只是避免把潜在正确预测错误地作为负例。
 
 \subsection{方法优缺点}
 
 \begin{itemize}
-    \item 优点：
-    \item 局限：
+    \item 优点：统一多提示形式，支持 RGB-only 与 RGB+depth 两种部署条件；通过双编码器和残差式融合降低语义/几何冲突；O2M 和辅助损失让 query 训练更稳定。
+    \item 局限：单目 3D 的尺度歧义仍然存在；深度后端的质量会直接影响 3D 框可靠性；开放世界长尾类别、严重遮挡和极端视角下的 3D 姿态估计仍可能不稳定。
 \end{itemize}

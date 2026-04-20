@@ -1,0 +1,35 @@
+\section{个人思考}
+
+\subsection{最值得吸收的设计}
+
+HY-Embodied-0.5 最值得借鉴的是把多模态具身模型拆成了明确的表示学习问题和任务对齐问题。预训练阶段不是只看最终答案，而是分别监督普通视觉 token、visual latent token 和语言 token，使局部视觉、全局摘要和文本生成各自有直接训练信号。
+
+第二个关键点是 MoT 的模态解耦。很多 VLM 直接把视觉 token 塞进 LLM，容易出现视觉训练冲击语言能力的问题。HY-Embodied-0.5 通过复制 QKV/FFN 并建立视觉专用参数，在保留 LLM 原始语言能力的同时，为视觉 token 提供更大的适配空间。
+
+第三个关键点是后训练 pipeline。SFT、RL、RFT 和 OPD 各自承担不同职责：SFT 冷启动推理，RL 探索能力边界，RFT 固化高质量推理轨迹，OPD 把大模型能力迁移到小模型。这比单纯 SFT 或单纯 RL 更贴近具身任务的复杂性。
+
+\subsection{需要警惕的问题}
+
+原始笔记中多处细节来自合理技术还原，而不是论文逐行给出的实现。例如 tiny LLM 的具体训练形式、视觉 tokenizer 的完整训练方法、MoT 内部 attention 的精确实现，都需要结合原论文和代码进一步确认。复现时不能只根据概念描述写实现。
+
+另一个风险是训练系统复杂度很高。离散视觉 code、teacher ViT、tiny LLM、MoT、visual latent token、三类预训练损失和多阶段后训练彼此耦合。任何一个模块实现不一致，都可能导致最终能力差异很大。
+
+\subsection{复现建议}
+
+\begin{enumerate}
+    \item 先复现视觉 token 与 language hidden size 的对齐接口，确认图像 token 能稳定进入 LLM/MoT 主干。
+    \item 再实现 visual latent token 和 global loss，检查 latent token 是否真的聚合整图语义。
+    \item 单独验证 vision loss 的 next-code prediction，确认离散视觉 code 的 teacher 质量和 token 对齐关系。
+    \item 最后再加入 MoT 的视觉/文本非共享参数，比较共享参数与非共享参数下的语言退化和视觉性能变化。
+    \item 后训练阶段应从 SFT 开始，不宜直接上 RL。具身任务 reward 复杂，若没有稳定的冷启动推理轨迹，RL 容易学到格式投机或不稳定策略。
+\end{enumerate}
+
+\subsection{后续问题}
+
+\begin{itemize}
+    \item tiny LLM 语言监督在论文实现中具体使用哪些文本目标，是 caption、QA、object tags，还是混合任务？
+    \item 离散视觉 tokenizer 的 teacher ViT 如何训练，codebook 是端到端学习还是离线量化得到？
+    \item MoT 中视觉 token 与文本 token 的 attention 是否完全交互，还是只在特定层或 latent token 处交互？
+    \item RL 阶段各类 reward 的权重如何平衡，LLM judge 的误判如何控制？
+    \item OPD 中 teacher forcing 的粒度是 token-level、step-level，还是完整推理轨迹级别？
+\end{itemize}
