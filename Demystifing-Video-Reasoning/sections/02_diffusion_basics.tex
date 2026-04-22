@@ -1,0 +1,134 @@
+\section{扩散与视频 Latent 基础}
+
+\subsection{扩散建模是什么}
+
+扩散建模的核心不是一次性生成图像或视频，而是学习一个从随机噪声逐步回到数据分布的逆过程。训练时可以理解为：先把真实数据逐步加噪，再训练模型学会每一步如何去噪。采样时则反过来，从高斯噪声出发，反复调用模型进行更新，最后得到一个清晰样本。
+
+因此，扩散模型更像一个迭代式生成器。每一步只做局部修正，但许多修正叠加后，就形成复杂的视频结构。本文研究的正是：这些一步步修正中，是否也发生了推理。
+
+\subsection{像素视频与 Latent 视频}
+
+普通视频在数据层面可写为
+
+\begin{equation}
+    x_{\mathrm{pixel}} \in \mathbb{R}^{B \times 3 \times T \times H \times W},
+\end{equation}
+
+其中 $B$ 是 batch size，$3$ 是 RGB 通道，$T$ 是帧数，$H,W$ 是空间分辨率。直接在这种像素空间中扩散计算量很大，因此现代视频生成模型通常先用 VAE encoder 把视频压缩到 latent 空间：
+
+\begin{equation}
+    z \in \mathbb{R}^{B \times C \times F \times h \times w}.
+\end{equation}
+
+这里 $C$ 是 latent 通道数，$F$ 是压缩后的时间维，$h,w$ 是压缩后的空间维。latent 通道不是 RGB 颜色，而是抽象视觉特征通道。每个时空位置不再存颜色，而是存一组压缩后的视觉、运动和结构特征。
+
+VAE decoder 则执行反向转换：
+
+\begin{equation}
+    x_{\mathrm{pixel}} = \mathrm{Decoder}(z).
+\end{equation}
+
+它把模型内部的低分辨率、高通道 latent 表示解码成可见 RGB 视频。本文中逐步可视化的中间状态，本质上是把某个 diffusion step 的 clean latent estimate 送入 VAE decoder 后得到的可视结果。
+
+\subsection{Flow Matching 形式}
+
+论文在 3.1 中使用 flow matching 形式描述 latent 演化：
+
+\begin{equation}
+    x_s = (1-s)x_0 + sx_1,
+\end{equation}
+
+其中 $x_0$ 是 clean latent，$x_1 \sim \mathcal{N}(0,I)$ 是噪声 latent，$s \in [0,1]$ 是扩散时间。直觉上，$s=1$ 更接近纯噪声，$s=0$ 更接近干净数据。
+
+需要注意，$x_s$ 不是网络某一层的输出，而是当前 diffusion time 下的中间 latent 状态。在同一个 $s$ 上，模型内部还会经过许多 DiT layers。也就是说，diffusion step 和 network layer 是两个不同维度。
+
+\subsection{速度场与 Clean Latent Estimate}
+
+模型学习一个以 prompt 条件 $c$ 为输入的速度场：
+
+\begin{equation}
+    v_\theta(x_s,s,c).
+\end{equation}
+
+它的含义是：在当前 latent 状态 $x_s$、当前时间 $s$、当前条件 $c$ 下，latent 应该朝哪个方向移动，才能更接近目标视频分布。模型当然是在学习参数 $\theta$，但从函数角度看，这些参数表示了一个速度场。
+
+论文分析的是每个 step 对最终 clean latent 的估计：
+
+\begin{equation}
+    \hat{x}_0 = x_s - \sigma_s \cdot v_\theta(x_s,s,c).
+\end{equation}
+
+这里 $\hat{x}_0$ 不是最终答案本身，而是“如果现在让模型交卷，它认为最终干净 latent 应该是什么”。$x_s$ 是带噪工作状态，$\hat{x}_0$ 是从当前状态反推出来的当前答案估计。论文选择可视化 $\hat{x}_0$，而不是直接可视化 $x_s$，是因为 $x_s$ 仍然混有大量噪声，不容易解释。
+
+\subsection{从 $x_s$ 到下一步的更新}
+
+在连续形式下，可将 latent 演化理解为
+
+\begin{equation}
+    \frac{dx_s}{ds} = v_\theta(x_s,s,c).
+\end{equation}
+
+采样时使用离散时间点 $s_0,s_1,\dots,s_K$。若从噪声端向数据端走，即 $s$ 从 1 递减到 0，最简单的 Euler 更新可写为
+
+\begin{equation}
+    x_{s_{k+1}} \approx x_{s_k} + (s_{k+1}-s_k)
+    v_\theta(x_{s_k},s_k,c).
+\end{equation}
+
+由于 $s_{k+1}<s_k$，也可写成
+
+\begin{equation}
+    x_{s_{k+1}} \approx x_{s_k} - \Delta s_k
+    v_\theta(x_{s_k},s_k,c), \qquad \Delta s_k=s_k-s_{k+1}>0.
+\end{equation}
+
+模型输出速度场，scheduler 或 solver 决定时间表、步长和具体更新公式。二者不是一回事：模型给方向，求解器负责按这个方向推进状态。
+
+\subsection{噪声尺度 $\sigma_s$}
+
+论文片段中只说 $\sigma_s$ 是控制当前扰动大小的噪声尺度，没有展开闭式公式。在最简单的线性 flow matching 路径
+
+\begin{equation}
+    x_s=(1-s)x_0+sx_1
+\end{equation}
+
+下，有
+
+\begin{equation}
+    x_s=x_0+s(x_1-x_0).
+\end{equation}
+
+若真实速度场为
+
+\begin{equation}
+    v^*(x_s,s,c)=x_1-x_0,
+\end{equation}
+
+则可推出
+
+\begin{equation}
+    x_0=x_s-sv^*(x_s,s,c).
+\end{equation}
+
+因此在这个最简线性设定下，自然可理解为 $\sigma_s=s$。但论文写成 $\sigma_s$，是为了保留更一般的噪声尺度和 scheduler 参数化。
+
+\subsection{CFG 与 Positive CFG Pass}
+
+CFG 即 Classifier-Free Guidance。训练时模型有时接收真实条件，有时接收空条件，从而同时学会 conditional 与 unconditional 两种预测。推理时每个扩散 step 上分别计算
+
+\begin{equation}
+    \epsilon_\theta(x_t,t,c), \qquad
+    \epsilon_\theta(x_t,t,\varnothing),
+\end{equation}
+
+再组合为
+
+\begin{equation}
+    \hat{\epsilon}
+    = \epsilon_\theta(x_t,t,\varnothing)
+    + w\left(\epsilon_\theta(x_t,t,c)-\epsilon_\theta(x_t,t,\varnothing)\right).
+\end{equation}
+
+直觉上，无条件分支表示“自然生成方向”，条件分支表示“符合 prompt 的方向”，二者差值表示 prompt 带来的额外修正。guidance scale $w$ 越大，模型越强调条件，但过大会损害自然性和多样性。
+
+论文逐层机制分析中提到 positive CFG pass，指的是 CFG 中带 prompt 的有条件前向传播。作者只提取这一路隐藏状态，是为了隔离模型响应 prompt 的主要推理路径，避免无条件分支和 guidance 混合效应干扰分析。

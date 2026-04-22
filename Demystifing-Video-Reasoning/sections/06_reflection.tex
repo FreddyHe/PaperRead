@@ -1,0 +1,56 @@
+\section{改进方法与个人思考}
+
+\subsection{无训练 Latent Ensemble}
+
+论文最后提出一个简单的 training-free 改进策略：使用三个相同模型、不同随机种子的 latent 轨迹，在推理时做 ensemble。其动机来自 CoS 发现：模型早期天然会探索多条候选推理路径。如果使用多个随机种子，就可能得到更丰富的候选轨迹；将这些 latent 合并后，模型更有机会保留正确候选并收敛到正确解。
+
+这个方法的意义不在于它本身已经是最优视频推理算法，而是作为 proof-of-concept：机制分析可以反过来指导推理策略设计。既然模型内部已经有多路径探索，就可以在推理时显式鼓励多样性和候选保留。
+
+\subsection{这篇论文最重要的启发}
+
+第一，视频生成模型不应只被理解为“画面生成器”。当任务具有时空一致环境和明确目标时，扩散过程本身可以承载某种推理。本文把这种推理从最终现象拉回到生成过程，说明机制分析比只看最终视频更重要。
+
+第二，扩散模型的“慢”不一定只是缺点。多步去噪提供了一个逐步探索、剪枝、修正和定稿的过程。与 LLM 的 CoT/ToT 类比，扩散模型的每个 step 都像一次全局草稿修改，而不是简单的画质细化。
+
+第三，机制分析需要区分相关性和因果性。Activation heatmap 可以告诉我们哪些区域表示更强，但 latent swapping 才更接近说明某层表示是否真正控制结果。
+
+\subsection{与 LLM 推理的关系}
+
+CoS 与 LLM 的 Chain-of-Thought 并不是同一种机制。CoT 是显式文本推理链，CoS 是隐式 latent refinement 轨迹。更接近的类比是 Tree of Thoughts：早期多分支候选、评估、剪枝、保留最优路径。但 ToT 通常需要显式外部搜索，成本较高；视频扩散模型中的多路径探索则是生成过程中的内生现象。
+
+这也提示一个方向：未来的视频推理系统也许可以结合 latent-space search 和 explicit reasoning control，在不完全依赖文本推理链的情况下，提高视觉空间任务中的决策能力。
+
+\subsection{需要警惕的地方}
+
+本文的机制结论很有启发，但也有边界。
+
+\begin{itemize}
+    \item 可视化 $\hat{x}_0$ 依赖 VAE decoder 和 clean estimate 公式，看到的中间图像不等于模型内部所有信息。
+    \item L2 activation energy 是解释性 proxy，不能单独证明重要性。
+    \item CoS 结论基于特定视频推理模型和任务集，是否普遍适用于所有视频扩散模型仍需更多验证。
+    \item 三个随机种子的 latent ensemble 是概念验证，真实部署中还需考虑计算成本和稳定性。
+\end{itemize}
+
+\subsection{复现建议}
+
+\begin{enumerate}
+    \item 先复现逐 step 解码 $\hat{x}_0$。这是观察 CoS 的核心工具，需要确认 scheduler、noise scale、VAE decoder 和时间步定义一致。
+    \item 再复现 Figure 1/2 中的典型任务，例如迷宫、物体移动和图案补全，观察早期多候选与后期剪枝是否稳定出现。
+    \item 对比 step-wise noise 与 frame-wise noise，验证破坏扩散步骤是否比破坏单帧影响更大。
+    \item 做 forward hook 捕获 DiT hidden states，按 $(B,N,D)$ 到 $(B,f,h,w,D)$ reshape，并计算 token L2 norm heatmap。
+    \item 最后做 latent swapping，验证中层表示替换是否能翻转结果，以区分可视化相关性和因果控制。
+\end{enumerate}
+
+\subsection{后续问题}
+
+\begin{itemize}
+    \item CoS 是否只在推理型视频任务中明显，还是普通文生视频也有类似多路径探索？
+    \item 中间 diffusion steps 最敏感的具体区间是否随 scheduler、采样步数和模型架构变化？
+    \item Latent ensemble 是否可以用更便宜的方式实现，例如只在中间关键步骤 ensemble，而不是全程三模型采样？
+    \item Activation energy 与 attention weights、MLP activation、residual norm 之间的关系是什么？
+    \item 能否训练模型显式控制 CoS，例如鼓励早期探索更多候选、在中期做更可靠剪枝？
+\end{itemize}
+
+\subsection{最终理解}
+
+这篇论文可以压缩成一句话：视频扩散模型的推理不是沿帧播放出来的，而是在去噪步骤中逐轮修改整段视频 latent；每一轮都对所有帧做全局协调，早期探索多个可能答案，中期剪枝并巩固结论，后期完成细节整合，而 DiT 内部又通过层级分工把感知、目标聚焦和推理计算拆开完成。
